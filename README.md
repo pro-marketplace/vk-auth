@@ -17,7 +17,17 @@ SSO авторизация через ВКонтакте (VK ID). **1 функц
    CREATE INDEX IF NOT EXISTS idx_users_vk_id ON users(vk_id);
    ```
 
-2. **ОБЯЗАТЕЛЬНО добавь ВСЕ секреты через тулу добавления секретов:**
+   **Проверь совместимость столбцов!** Функция работает с полями:
+   - `vk_id` — VARCHAR, может быть NULL
+   - `email` — VARCHAR, может быть NULL
+   - `name` — VARCHAR, может быть NULL
+   - `avatar_url` — TEXT, может быть NULL
+   - `email_verified` — BOOLEAN, DEFAULT TRUE
+   - `created_at`, `updated_at`, `last_login_at` — TIMESTAMP
+
+   Если какой-то столбец имеет `NOT NULL` без `DEFAULT` — функция упадёт при вставке!
+
+2. **ОБЯЗАТЕЛЬНО добавь ВСЕ секреты через тулу `put_secret`:**
    ```
    VK_CLIENT_ID=<ID приложения>
    VK_CLIENT_SECRET=<Защищённый ключ>
