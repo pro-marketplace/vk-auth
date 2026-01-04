@@ -326,32 +326,57 @@ def handle_callback(event: dict, origin: str) -> dict:
             # Cleanup expired tokens periodically
             cleanup_expired_tokens(cur, S)
 
-            # Check if user exists by vk_id (parameterized query)
+            # 1. Check if user exists by vk_id
             cur.execute(
-                f"SELECT id, email, name FROM {S}users WHERE vk_id = %s",
+                f"SELECT id, email, name, avatar_url FROM {S}users WHERE vk_id = %s",
                 (str(vk_user_id),)
             )
             row = cur.fetchone()
 
             if row:
-                user_id, email, name = row
-                # Update last login
+                # User found by vk_id - just login
+                user_id, email, name, db_avatar = row
                 cur.execute(
                     f"UPDATE {S}users SET last_login_at = %s, updated_at = %s WHERE id = %s",
                     (now, now, user_id)
                 )
+                email = email or vk_email
+                name = name or full_name
+                photo_url = db_avatar or photo_url
             else:
-                # Create new user
-                cur.execute(
-                    f"""INSERT INTO {S}users
-                        (vk_id, email, name, avatar_url, email_verified, created_at, updated_at, last_login_at)
-                        VALUES (%s, %s, %s, %s, TRUE, %s, %s, %s)
-                        RETURNING id""",
-                    (str(vk_user_id), vk_email, full_name, photo_url, now, now, now)
-                )
-                user_id = cur.fetchone()[0]
-                email = vk_email
-                name = full_name
+                # 2. Check if user exists by email - link VK account
+                if vk_email:
+                    cur.execute(
+                        f"SELECT id, name, avatar_url FROM {S}users WHERE email = %s",
+                        (vk_email,)
+                    )
+                    row = cur.fetchone()
+
+                if vk_email and row:
+                    # User found by email - link VK account
+                    user_id, db_name, db_avatar = row
+                    cur.execute(
+                        f"""UPDATE {S}users
+                            SET vk_id = %s, avatar_url = COALESCE(avatar_url, %s),
+                                last_login_at = %s, updated_at = %s
+                            WHERE id = %s""",
+                        (str(vk_user_id), photo_url, now, now, user_id)
+                    )
+                    email = vk_email
+                    name = db_name or full_name
+                    photo_url = db_avatar or photo_url
+                else:
+                    # 3. Create new user
+                    cur.execute(
+                        f"""INSERT INTO {S}users
+                            (vk_id, email, name, avatar_url, email_verified, created_at, updated_at, last_login_at)
+                            VALUES (%s, %s, %s, %s, TRUE, %s, %s, %s)
+                            RETURNING id""",
+                        (str(vk_user_id), vk_email, full_name, photo_url, now, now, now)
+                    )
+                    user_id = cur.fetchone()[0]
+                    email = vk_email
+                    name = full_name
 
             # Create tokens
             access_token, expires_in = create_access_token(user_id, email)
