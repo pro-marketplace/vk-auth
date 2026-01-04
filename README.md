@@ -113,7 +113,8 @@ CREATE INDEX idx_refresh_tokens_hash ON refresh_tokens(token_hash);
 | `VK_CLIENT_ID` | ID приложения | Настройки приложения VK ID |
 | `VK_CLIENT_SECRET` | Защищённый ключ | Раздел "Ключи доступа" |
 | `VK_REDIRECT_URI` | URL callback страницы | Должен совпадать с "Доверенный Redirect URL" |
-| `JWT_SECRET` | Секрет для токенов | `openssl rand -hex 32` |
+| `JWT_SECRET` | Секрет для токенов (мин. 32 символа) | `openssl rand -hex 32` |
+| `ALLOWED_ORIGINS` | (опционально) Разрешённые домены через запятую | `https://example.com,https://app.example.com` |
 
 ---
 
@@ -222,9 +223,14 @@ export default function VkCallbackPage() {
 ## Безопасность
 
 - JWT access tokens (15 мин)
-- Refresh tokens (30 дней) в localStorage
+- Refresh tokens хешируются (SHA256) перед сохранением в БД
+- Автоочистка протухших токенов при каждом запросе
 - CSRF protection через state параметр
-- Секреты только на сервере
+- PKCE (code_verifier/code_challenge) защита OAuth flow
+- Параметризованные SQL-запросы (защита от SQL injection)
+- Валидация JWT_SECRET (минимум 32 символа)
+- CORS ограничение через `ALLOWED_ORIGINS`
+- Скрытие внутренних ошибок от клиента
 
 ---
 

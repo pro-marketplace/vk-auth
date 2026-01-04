@@ -4,7 +4,7 @@ import os
 import secrets
 import base64
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 from urllib.error import HTTPError
@@ -24,7 +24,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 HEADERS = {
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Content-Type': 'application/json'
@@ -46,32 +45,44 @@ def get_schema() -> str:
     return f"{schema}." if schema else ""
 
 
-def escape(value):
-    """Escape value for SQL."""
-    if value is None:
-        return 'NULL'
-    if isinstance(value, bool):
-        return 'TRUE' if value else 'FALSE'
-    if isinstance(value, (int, float)):
-        return str(value)
-    escaped = str(value).replace("'", "''")
-    return f"'{escaped}'"
+def cleanup_expired_tokens(cur, schema: str) -> None:
+    """Delete expired refresh tokens."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute(f"DELETE FROM {schema}refresh_tokens WHERE expires_at < %s", (now,))
+
+
+# =============================================================================
+# SECURITY
+# =============================================================================
+
+def hash_token(token: str) -> str:
+    """Hash token with SHA256 for secure storage."""
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+def get_jwt_secret() -> str:
+    """Get JWT secret with validation."""
+    secret = os.environ.get('JWT_SECRET', '')
+    if not secret or len(secret) < 32:
+        raise ValueError('JWT_SECRET must be at least 32 characters')
+    return secret
 
 
 # =============================================================================
 # JWT
 # =============================================================================
 
-def create_access_token(user_id: int, email: str = None) -> tuple[str, int]:
+def create_access_token(user_id: int, email: str | None = None) -> tuple[str, int]:
     """Create JWT access token."""
-    secret = os.environ.get('JWT_SECRET', '')
+    secret = get_jwt_secret()
     expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    expire = datetime.utcnow() + expires_delta
+    now = datetime.now(timezone.utc)
+    expire = now + expires_delta
 
     payload = {
         'sub': str(user_id),
         'exp': expire,
-        'iat': datetime.utcnow(),
+        'iat': now,
         'type': 'access'
     }
     if email:
@@ -110,7 +121,7 @@ def exchange_code_for_token(
     client_secret: str,
     redirect_uri: str,
     code_verifier: str,
-    device_id: str = None
+    device_id: str | None = None
 ) -> dict:
     """Exchange authorization code for access token with PKCE."""
     data = {
@@ -140,30 +151,59 @@ def exchange_code_for_token(
         try:
             return json.loads(error_body)
         except json.JSONDecodeError:
-            return {'error': 'http_error', 'error_description': error_body}
+            return {'error': 'http_error', 'error_description': 'VK API request failed'}
 
 
-def get_vk_user_info(access_token: str) -> dict:
-    """Get user info from VK ID API."""
+def get_vk_user_info(access_token: str, client_id: str) -> dict:
+    """Get user info from VK ID API (POST method)."""
+    data = {
+        'access_token': access_token,
+        'client_id': client_id
+    }
+
     request = Request(
         VK_USER_INFO_URL,
-        headers={'Authorization': f'Bearer {access_token}'},
-        method='GET'
+        data=urlencode(data).encode('utf-8'),
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        method='POST'
     )
 
     with urlopen(request, timeout=10) as response:
-        data = json.loads(response.read().decode())
-        return data.get('user', {})
+        result = json.loads(response.read().decode())
+        return result.get('user', {})
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
+def get_allowed_origins() -> list[str]:
+    """Get list of allowed origins from environment."""
+    origins = os.environ.get('ALLOWED_ORIGINS', '')
+    if origins:
+        return [o.strip() for o in origins.split(',')]
+    return []
+
+
+def is_origin_allowed(origin: str) -> bool:
+    """Check if origin is allowed."""
+    allowed = get_allowed_origins()
+    if not allowed:
+        return True  # No restrictions if not configured
+    return origin in allowed
+
+
 def response(status_code: int, body: dict, origin: str = '*') -> dict:
     """Create HTTP response."""
     headers = HEADERS.copy()
-    headers['Access-Control-Allow-Origin'] = origin
+    # Use specific origin if allowed, otherwise deny
+    if origin != '*' and is_origin_allowed(origin):
+        headers['Access-Control-Allow-Origin'] = origin
+    elif not get_allowed_origins():
+        headers['Access-Control-Allow-Origin'] = origin if origin != '*' else '*'
+    else:
+        headers['Access-Control-Allow-Origin'] = 'null'
+
     return {
         'statusCode': status_code,
         'headers': headers,
@@ -192,7 +232,7 @@ def handle_auth_url(event: dict, origin: str) -> dict:
     redirect_uri = os.environ.get('VK_REDIRECT_URI', '')
 
     if not client_id or not redirect_uri:
-        return error(500, 'VK credentials not configured', origin)
+        return error(500, 'Server configuration error', origin)
 
     # Generate state for CSRF protection
     state = secrets.token_urlsafe(16)
@@ -246,7 +286,13 @@ def handle_callback(event: dict, origin: str) -> dict:
     redirect_uri = os.environ.get('VK_REDIRECT_URI', '')
 
     if not client_id or not client_secret:
-        return error(500, 'VK credentials not configured', origin)
+        return error(500, 'Server configuration error', origin)
+
+    try:
+        # Validate JWT_SECRET early
+        get_jwt_secret()
+    except ValueError:
+        return error(500, 'Server configuration error', origin)
 
     try:
         # Exchange code for token with PKCE
@@ -260,7 +306,7 @@ def handle_callback(event: dict, origin: str) -> dict:
         vk_access_token = token_data.get('access_token')
 
         # Get user info from VK ID API
-        user_info = get_vk_user_info(vk_access_token)
+        user_info = get_vk_user_info(vk_access_token, client_id)
 
         vk_user_id = user_info.get('user_id', user_info.get('id', ''))
         first_name = user_info.get('first_name', '')
@@ -275,27 +321,34 @@ def handle_callback(event: dict, origin: str) -> dict:
 
         try:
             cur = conn.cursor()
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
 
-            # Check if user exists by vk_id
-            cur.execute(f"SELECT id, email, name FROM {S}users WHERE vk_id = {escape(str(vk_user_id))}")
+            # Cleanup expired tokens periodically
+            cleanup_expired_tokens(cur, S)
+
+            # Check if user exists by vk_id (parameterized query)
+            cur.execute(
+                f"SELECT id, email, name FROM {S}users WHERE vk_id = %s",
+                (str(vk_user_id),)
+            )
             row = cur.fetchone()
 
             if row:
                 user_id, email, name = row
                 # Update last login
-                cur.execute(f"""
-                    UPDATE {S}users
-                    SET last_login_at = {escape(now)}, updated_at = {escape(now)}
-                    WHERE id = {escape(user_id)}
-                """)
+                cur.execute(
+                    f"UPDATE {S}users SET last_login_at = %s, updated_at = %s WHERE id = %s",
+                    (now, now, user_id)
+                )
             else:
                 # Create new user
-                cur.execute(f"""
-                    INSERT INTO {S}users (vk_id, email, name, avatar_url, email_verified, created_at, updated_at, last_login_at)
-                    VALUES ({escape(str(vk_user_id))}, {escape(vk_email)}, {escape(full_name)}, {escape(photo_url)}, TRUE, {escape(now)}, {escape(now)}, {escape(now)})
-                    RETURNING id
-                """)
+                cur.execute(
+                    f"""INSERT INTO {S}users
+                        (vk_id, email, name, avatar_url, email_verified, created_at, updated_at, last_login_at)
+                        VALUES (%s, %s, %s, %s, TRUE, %s, %s, %s)
+                        RETURNING id""",
+                    (str(vk_user_id), vk_email, full_name, photo_url, now, now, now)
+                )
                 user_id = cur.fetchone()[0]
                 email = vk_email
                 name = full_name
@@ -303,13 +356,15 @@ def handle_callback(event: dict, origin: str) -> dict:
             # Create tokens
             access_token, expires_in = create_access_token(user_id, email)
             refresh_token = create_refresh_token()
-            refresh_expires = (datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+            refresh_token_hash = hash_token(refresh_token)
+            refresh_expires = (datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
 
-            # Store refresh token
-            cur.execute(f"""
-                INSERT INTO {S}refresh_tokens (user_id, token_hash, expires_at, created_at)
-                VALUES ({escape(user_id)}, {escape(refresh_token)}, {escape(refresh_expires)}, {escape(now)})
-            """)
+            # Store hashed refresh token
+            cur.execute(
+                f"""INSERT INTO {S}refresh_tokens (user_id, token_hash, expires_at, created_at)
+                    VALUES (%s, %s, %s, %s)""",
+                (user_id, refresh_token_hash, refresh_expires, now)
+            )
 
             conn.commit()
 
@@ -326,17 +381,16 @@ def handle_callback(event: dict, origin: str) -> dict:
                 }
             }, origin)
 
-        except Exception as e:
+        except Exception:
             conn.rollback()
-            return error(500, str(e), origin)
+            return error(500, 'Database error', origin)
         finally:
             conn.close()
 
-    except HTTPError as e:
-        error_body = e.read().decode() if e.fp else str(e)
-        return error(500, f'VK API error: {error_body}', origin)
-    except Exception as e:
-        return error(500, str(e), origin)
+    except HTTPError:
+        return error(500, 'VK API error', origin)
+    except Exception:
+        return error(500, 'Internal server error', origin)
 
 
 def handle_refresh(event: dict, origin: str) -> dict:
@@ -354,27 +408,42 @@ def handle_refresh(event: dict, origin: str) -> dict:
     if not refresh_token:
         return error(400, 'refresh_token is required', origin)
 
+    try:
+        get_jwt_secret()
+    except ValueError:
+        return error(500, 'Server configuration error', origin)
+
     S = get_schema()
     conn = get_connection()
 
     try:
         cur = conn.cursor()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
-        cur.execute(f"""
-            SELECT rt.user_id, u.email, u.name, u.avatar_url, u.vk_id
-            FROM {S}refresh_tokens rt
-            JOIN {S}users u ON u.id = rt.user_id
-            WHERE rt.token_hash = {escape(refresh_token)} AND rt.expires_at > {escape(now.isoformat())}
-        """)
+        # Cleanup expired tokens
+        cleanup_expired_tokens(cur, S)
+
+        # Hash the provided token to compare with stored hash
+        token_hash = hash_token(refresh_token)
+
+        cur.execute(
+            f"""SELECT rt.user_id, u.email, u.name, u.avatar_url, u.vk_id
+                FROM {S}refresh_tokens rt
+                JOIN {S}users u ON u.id = rt.user_id
+                WHERE rt.token_hash = %s AND rt.expires_at > %s""",
+            (token_hash, now.isoformat())
+        )
 
         row = cur.fetchone()
         if not row:
+            conn.commit()  # Commit cleanup
             return error(401, 'Invalid or expired refresh token', origin)
 
         user_id, email, name, avatar_url, vk_id = row
 
         access_token, expires_in = create_access_token(user_id, email)
+
+        conn.commit()
 
         return response(200, {
             'access_token': access_token,
@@ -388,8 +457,8 @@ def handle_refresh(event: dict, origin: str) -> dict:
             }
         }, origin)
 
-    except Exception as e:
-        return error(500, str(e), origin)
+    except Exception:
+        return error(500, 'Internal server error', origin)
     finally:
         conn.close()
 
@@ -411,7 +480,13 @@ def handle_logout(event: dict, origin: str) -> dict:
         conn = get_connection()
         try:
             cur = conn.cursor()
-            cur.execute(f"DELETE FROM {S}refresh_tokens WHERE token_hash = {escape(refresh_token)}")
+            token_hash = hash_token(refresh_token)
+            cur.execute(
+                f"DELETE FROM {S}refresh_tokens WHERE token_hash = %s",
+                (token_hash,)
+            )
+            # Also cleanup expired tokens
+            cleanup_expired_tokens(cur, S)
             conn.commit()
         except Exception:
             pass
@@ -425,12 +500,15 @@ def handle_logout(event: dict, origin: str) -> dict:
 # MAIN HANDLER
 # =============================================================================
 
-def handler(event, context):
+def handler(event: dict, context) -> dict:
     """Main handler - routes to specific handlers based on action."""
-    if event.get('httpMethod') == 'OPTIONS':
-        return {'statusCode': 200, 'headers': HEADERS, 'body': ''}
-
     origin = get_origin(event)
+
+    if event.get('httpMethod') == 'OPTIONS':
+        headers = HEADERS.copy()
+        headers['Access-Control-Allow-Origin'] = origin if origin != '*' else '*'
+        return {'statusCode': 200, 'headers': headers, 'body': ''}
+
     query = event.get('queryStringParameters', {}) or {}
     action = query.get('action', '')
 
@@ -442,6 +520,6 @@ def handler(event, context):
     }
 
     if action not in handlers:
-        return error(400, f'Unknown action: {action}. Available: {", ".join(handlers.keys())}', origin)
+        return error(400, f'Unknown action: {action}', origin)
 
     return handlers[action](event, origin)
