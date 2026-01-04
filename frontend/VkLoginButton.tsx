@@ -47,7 +47,7 @@ function VkIcon({ className }: { className?: string }) {
 export function VkLoginButton({
   onClick,
   isLoading = false,
-  buttonText = "Войти через VK",
+  buttonText = "Войти через ВК",
   className = "",
   disabled = false,
 }: VkLoginButtonProps): React.ReactElement {
@@ -57,8 +57,9 @@ export function VkLoginButton({
       disabled={disabled || isLoading}
       className={`bg-[#0077FF] hover:bg-[#0066DD] text-white ${className}`}
     >
-      <VkIcon className="w-5 h-5 mr-2" />
+      <VkIcon className="!w-6 !h-7 mr-1 flex-shrink-0 justify-start" />
       {isLoading ? "Загрузка..." : buttonText}
+
     </Button>
   );
 }
