@@ -1,11 +1,12 @@
-"""VK OAuth authentication handler."""
+"""VK OAuth authentication handler with PKCE."""
 import json
 import os
 import secrets
 import base64
+import hashlib
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode
 from urllib.error import HTTPError
 
 import jwt
@@ -15,10 +16,9 @@ import psycopg2
 # CONSTANTS
 # =============================================================================
 
-VK_AUTHORIZE_URL = "https://oauth.vk.com/authorize"
-VK_TOKEN_URL = "https://oauth.vk.com/access_token"
-VK_API_URL = "https://api.vk.com/method"
-VK_API_VERSION = "5.131"
+VK_AUTHORIZE_URL = "https://id.vk.com/authorize"
+VK_TOKEN_URL = "https://id.vk.com/oauth2/auth"
+VK_USER_INFO_URL = "https://id.vk.com/oauth2/user_info"
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 30
@@ -90,53 +90,70 @@ def create_refresh_token() -> str:
 # VK API
 # =============================================================================
 
-def get_vk_auth_url(client_id: str, redirect_uri: str, state: str) -> str:
-    """Generate VK authorization URL."""
+def get_vk_auth_url(client_id: str, redirect_uri: str, state: str, code_challenge: str) -> str:
+    """Generate VK ID authorization URL with PKCE."""
     params = {
         'client_id': client_id,
         'redirect_uri': redirect_uri,
         'response_type': 'code',
         'scope': 'email',
         'state': state,
-        'v': VK_API_VERSION
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256'
     }
     return f"{VK_AUTHORIZE_URL}?{urlencode(params)}"
 
 
-def exchange_code_for_token(code: str, client_id: str, client_secret: str, redirect_uri: str) -> dict:
-    """Exchange authorization code for access token."""
-    params = {
+def exchange_code_for_token(
+    code: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    code_verifier: str,
+    device_id: str = None
+) -> dict:
+    """Exchange authorization code for access token with PKCE."""
+    data = {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': redirect_uri,
         'client_id': client_id,
         'client_secret': client_secret,
-        'redirect_uri': redirect_uri,
-        'code': code,
-        'v': VK_API_VERSION
+        'code_verifier': code_verifier
     }
 
-    url = f"{VK_TOKEN_URL}?{urlencode(params)}"
-    request = Request(url, method='GET')
+    if device_id:
+        data['device_id'] = device_id
 
-    with urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode())
+    request = Request(
+        VK_TOKEN_URL,
+        data=urlencode(data).encode('utf-8'),
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        method='POST'
+    )
+
+    try:
+        with urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except HTTPError as e:
+        error_body = e.read().decode()
+        try:
+            return json.loads(error_body)
+        except json.JSONDecodeError:
+            return {'error': 'http_error', 'error_description': error_body}
 
 
-def get_vk_user_info(access_token: str, user_id: int) -> dict:
-    """Get user info from VK API."""
-    params = {
-        'user_ids': user_id,
-        'fields': 'photo_100,photo_200',
-        'access_token': access_token,
-        'v': VK_API_VERSION
-    }
-
-    url = f"{VK_API_URL}/users.get?{urlencode(params)}"
-    request = Request(url, method='GET')
+def get_vk_user_info(access_token: str) -> dict:
+    """Get user info from VK ID API."""
+    request = Request(
+        VK_USER_INFO_URL,
+        headers={'Authorization': f'Bearer {access_token}'},
+        method='GET'
+    )
 
     with urlopen(request, timeout=10) as response:
         data = json.loads(response.read().decode())
-        if 'response' in data and len(data['response']) > 0:
-            return data['response'][0]
-        return {}
+        return data.get('user', {})
 
 
 # =============================================================================
@@ -170,7 +187,7 @@ def get_origin(event: dict) -> str:
 # =============================================================================
 
 def handle_auth_url(event: dict, origin: str) -> dict:
-    """Generate VK authorization URL."""
+    """Generate VK authorization URL with PKCE."""
     client_id = os.environ.get('VK_CLIENT_ID', '')
     redirect_uri = os.environ.get('VK_REDIRECT_URI', '')
 
@@ -180,17 +197,24 @@ def handle_auth_url(event: dict, origin: str) -> dict:
     # Generate state for CSRF protection
     state = secrets.token_urlsafe(16)
 
-    auth_url = get_vk_auth_url(client_id, redirect_uri, state)
+    # Generate PKCE code_verifier and code_challenge
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    ).decode('utf-8').rstrip('=')
+
+    auth_url = get_vk_auth_url(client_id, redirect_uri, state, code_challenge)
 
     return response(200, {
         'auth_url': auth_url,
-        'state': state
+        'state': state,
+        'code_verifier': code_verifier
     }, origin)
 
 
 def handle_callback(event: dict, origin: str) -> dict:
-    """Handle VK OAuth callback."""
-    # Parse body or query params
+    """Handle VK OAuth callback with PKCE."""
+    # Parse body
     body_str = event.get('body', '{}')
     if event.get('isBase64Encoded'):
         body_str = base64.b64decode(body_str).decode('utf-8')
@@ -200,14 +224,22 @@ def handle_callback(event: dict, origin: str) -> dict:
     except json.JSONDecodeError:
         payload = {}
 
-    # Get code from body or query
+    # Get code, code_verifier, and device_id
     code = payload.get('code', '')
+    code_verifier = payload.get('code_verifier', '')
+    device_id = payload.get('device_id', '')
+
     if not code:
         query = event.get('queryStringParameters', {}) or {}
         code = query.get('code', '')
+        code_verifier = query.get('code_verifier', '')
+        device_id = query.get('device_id', '')
 
     if not code:
         return error(400, 'Authorization code is required', origin)
+
+    if not code_verifier:
+        return error(400, 'Code verifier is required', origin)
 
     client_id = os.environ.get('VK_CLIENT_ID', '')
     client_secret = os.environ.get('VK_CLIENT_SECRET', '')
@@ -217,21 +249,24 @@ def handle_callback(event: dict, origin: str) -> dict:
         return error(500, 'VK credentials not configured', origin)
 
     try:
-        # Exchange code for token
-        token_data = exchange_code_for_token(code, client_id, client_secret, redirect_uri)
+        # Exchange code for token with PKCE
+        token_data = exchange_code_for_token(
+            code, client_id, client_secret, redirect_uri, code_verifier, device_id
+        )
 
         if 'error' in token_data:
             return error(400, token_data.get('error_description', 'VK auth failed'), origin)
 
         vk_access_token = token_data.get('access_token')
-        vk_user_id = token_data.get('user_id')
-        vk_email = token_data.get('email')  # May be None if user didn't grant email permission
 
-        # Get user info
-        user_info = get_vk_user_info(vk_access_token, vk_user_id)
+        # Get user info from VK ID API
+        user_info = get_vk_user_info(vk_access_token)
+
+        vk_user_id = user_info.get('user_id', user_info.get('id', ''))
         first_name = user_info.get('first_name', '')
         last_name = user_info.get('last_name', '')
-        photo_url = user_info.get('photo_200', user_info.get('photo_100', ''))
+        vk_email = user_info.get('email')
+        photo_url = user_info.get('avatar', '')
         full_name = f"{first_name} {last_name}".strip()
 
         # Find or create user
@@ -249,7 +284,11 @@ def handle_callback(event: dict, origin: str) -> dict:
             if row:
                 user_id, email, name = row
                 # Update last login
-                cur.execute(f"UPDATE {S}users SET last_login_at = {escape(now)}, updated_at = {escape(now)} WHERE id = {escape(user_id)}")
+                cur.execute(f"""
+                    UPDATE {S}users
+                    SET last_login_at = {escape(now)}, updated_at = {escape(now)}
+                    WHERE id = {escape(user_id)}
+                """)
             else:
                 # Create new user
                 cur.execute(f"""
@@ -322,7 +361,6 @@ def handle_refresh(event: dict, origin: str) -> dict:
         cur = conn.cursor()
         now = datetime.utcnow()
 
-        # Find refresh token
         cur.execute(f"""
             SELECT rt.user_id, u.email, u.name, u.avatar_url, u.vk_id
             FROM {S}refresh_tokens rt
@@ -336,7 +374,6 @@ def handle_refresh(event: dict, origin: str) -> dict:
 
         user_id, email, name, avatar_url, vk_id = row
 
-        # Create new access token
         access_token, expires_in = create_access_token(user_id, email)
 
         return response(200, {
@@ -390,7 +427,6 @@ def handle_logout(event: dict, origin: str) -> dict:
 
 def handler(event, context):
     """Main handler - routes to specific handlers based on action."""
-    # CORS preflight
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': HEADERS, 'body': ''}
 

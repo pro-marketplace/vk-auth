@@ -46,9 +46,18 @@ SSO авторизация через ВКонтакте (VK ID). **1 функц
 
 ### Шаг 3: Данные для регистрации
 
-1. **Базовый домен**: `your-site.com` (без https://)
-2. **Доверенный Redirect URL**: `https://your-site.com/auth/vk/callback`
-3. Нажми **"Создать приложение"**
+**ВАЖНО:** У вас есть 2 среды — добавьте ОБЕ!
+
+| Среда | Базовый домен | Redirect URL |
+|-------|---------------|--------------|
+| **Разработка** | `preview--{project}.poehali.dev` | `https://preview--{project}.poehali.dev/auth/vk/callback` |
+| **Продакшн** | `your-domain.com` или `{project}--preview.poehali.dev` | `https://your-domain.com/auth/vk/callback` |
+
+1. Добавь **базовый домен** продакшна
+2. Нажми **"+ Добавить базовый домен"** → добавь домен разработки
+3. Добавь **Redirect URL** продакшна
+4. Нажми **"+ Добавить доверенный Redirect URL"** → добавь URL разработки
+5. Нажми **"Создать приложение"**
 
 ### Шаг 4: Способы входа
 
@@ -151,34 +160,62 @@ if (auth.isAuthenticated && auth.user) {
 ### Страница callback
 
 Создай страницу `/auth/vk/callback` которая:
-1. Получает `code` из URL параметров
-2. Вызывает `auth.handleCallback(code)`
-3. Редиректит на главную
+1. Вызывает `auth.handleCallback()` — автоматически извлечёт code, device_id, state из URL
+2. Редиректит на главную при успехе
 
 ```tsx
-// pages/auth/vk/callback.tsx
-useEffect(() => {
-  const code = new URLSearchParams(window.location.search).get("code");
-  if (code) {
-    auth.handleCallback(code).then((success) => {
-      if (success) router.push("/");
+// pages/auth/vk/callback.tsx или app/auth/vk/callback/page.tsx
+"use client";
+
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useVkAuth } from "@/hooks/useVkAuth";
+
+export default function VkCallbackPage() {
+  const router = useRouter();
+  const auth = useVkAuth({
+    apiUrls: {
+      authUrl: `${process.env.NEXT_PUBLIC_VK_AUTH_URL}?action=auth-url`,
+      callback: `${process.env.NEXT_PUBLIC_VK_AUTH_URL}?action=callback`,
+      refresh: `${process.env.NEXT_PUBLIC_VK_AUTH_URL}?action=refresh`,
+      logout: `${process.env.NEXT_PUBLIC_VK_AUTH_URL}?action=logout`,
+    },
+  });
+
+  useEffect(() => {
+    // handleCallback() автоматически извлекает code, device_id, state из URL
+    auth.handleCallback().then((success) => {
+      if (success) {
+        router.push("/");
+      }
     });
-  }
-}, []);
+  }, []);
+
+  return (
+    <div className="flex items-center justify-center min-h-screen">
+      <p>Авторизация...</p>
+    </div>
+  );
+}
 ```
 
 ---
 
-## Поток авторизации
+## Поток авторизации (PKCE)
 
 ```
 1. Пользователь нажимает "Войти через VK"
-2. Frontend → GET ?action=auth-url → получает URL
-3. Редирект на VK для авторизации
-4. VK → редирект на callback с ?code=...
-5. Frontend → POST ?action=callback → обмен code на токены
-6. Показываем UserProfile
+2. Frontend → GET ?action=auth-url → получает auth_url + code_verifier
+3. Frontend сохраняет code_verifier в sessionStorage
+4. Редирект на VK для авторизации
+5. VK → редирект на callback с ?code=...&device_id=...&state=...
+6. Frontend извлекает code, device_id из URL
+7. Frontend → POST ?action=callback { code, code_verifier, device_id }
+8. Backend обменивает code на токены через VK API
+9. Показываем UserProfile
 ```
+
+> **PKCE** (Proof Key for Code Exchange) — защита от перехвата authorization code
 
 ---
 

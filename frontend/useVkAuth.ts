@@ -1,7 +1,7 @@
 /**
  * VK Auth Extension - useVkAuth Hook
  *
- * React hook for VK OAuth authentication.
+ * React hook for VK OAuth authentication with PKCE.
  */
 import { useState, useCallback, useEffect, useRef } from "react";
 
@@ -10,6 +10,8 @@ import { useState, useCallback, useEffect, useRef } from "react";
 // =============================================================================
 
 const REFRESH_TOKEN_KEY = "vk_auth_refresh_token";
+const CODE_VERIFIER_KEY = "vk_auth_code_verifier";
+const STATE_KEY = "vk_auth_state";
 
 export interface User {
   id: number;
@@ -40,7 +42,7 @@ interface UseVkAuthReturn {
   error: string | null;
   accessToken: string | null;
   login: () => Promise<void>;
-  handleCallback: (code: string) => Promise<boolean>;
+  handleCallback: (urlParams?: URLSearchParams) => Promise<boolean>;
   logout: () => Promise<void>;
   refreshToken: () => Promise<boolean>;
   getAuthHeader: () => { Authorization: string } | {};
@@ -63,6 +65,36 @@ function setStoredRefreshToken(token: string): void {
 function clearStoredRefreshToken(): void {
   if (typeof window === "undefined") return;
   localStorage.removeItem(REFRESH_TOKEN_KEY);
+}
+
+function getStoredCodeVerifier(): string | null {
+  if (typeof window === "undefined") return null;
+  return sessionStorage.getItem(CODE_VERIFIER_KEY);
+}
+
+function setStoredCodeVerifier(verifier: string): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(CODE_VERIFIER_KEY, verifier);
+}
+
+function clearStoredCodeVerifier(): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.removeItem(CODE_VERIFIER_KEY);
+}
+
+function setStoredState(state: string): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(STATE_KEY, state);
+}
+
+function getStoredState(): string | null {
+  if (typeof window === "undefined") return null;
+  return sessionStorage.getItem(STATE_KEY);
+}
+
+function clearStoredState(): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.removeItem(STATE_KEY);
 }
 
 // =============================================================================
@@ -91,6 +123,8 @@ export function useVkAuth(options: UseVkAuthOptions): UseVkAuthReturn {
     setAccessToken(null);
     setUser(null);
     clearStoredRefreshToken();
+    clearStoredCodeVerifier();
+    clearStoredState();
   }, []);
 
   const scheduleRefresh = useCallback(
@@ -184,9 +218,14 @@ export function useVkAuth(options: UseVkAuthOptions): UseVkAuthReturn {
         return;
       }
 
-      // Store state for CSRF verification
-      if (typeof window !== "undefined" && data.state) {
-        sessionStorage.setItem("vk_auth_state", data.state);
+      // Store state and code_verifier for callback
+      if (typeof window !== "undefined") {
+        if (data.state) {
+          setStoredState(data.state);
+        }
+        if (data.code_verifier) {
+          setStoredCodeVerifier(data.code_verifier);
+        }
       }
 
       // Redirect to VK
@@ -198,17 +237,47 @@ export function useVkAuth(options: UseVkAuthOptions): UseVkAuthReturn {
 
   /**
    * Handle OAuth callback - exchange code for tokens
+   * @param urlParams - Optional URLSearchParams, defaults to current URL
    */
   const handleCallback = useCallback(
-    async (code: string): Promise<boolean> => {
+    async (urlParams?: URLSearchParams): Promise<boolean> => {
       setIsLoading(true);
       setError(null);
 
       try {
+        // Get params from URL or provided params
+        const params = urlParams || new URLSearchParams(window.location.search);
+        const code = params.get("code");
+        const device_id = params.get("device_id");
+        const state = params.get("state");
+
+        if (!code) {
+          setError("No authorization code received");
+          return false;
+        }
+
+        // Verify state for CSRF protection
+        const storedState = getStoredState();
+        if (storedState && state !== storedState) {
+          setError("Invalid state parameter");
+          return false;
+        }
+
+        // Get stored code_verifier
+        const code_verifier = getStoredCodeVerifier();
+        if (!code_verifier) {
+          setError("No code verifier found. Please try logging in again.");
+          return false;
+        }
+
         const response = await fetch(apiUrls.callback, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
+          body: JSON.stringify({
+            code,
+            code_verifier,
+            device_id: device_id || "",
+          }),
         });
 
         const data = await response.json();
@@ -218,6 +287,11 @@ export function useVkAuth(options: UseVkAuthOptions): UseVkAuthReturn {
           return false;
         }
 
+        // Clear temporary storage
+        clearStoredCodeVerifier();
+        clearStoredState();
+
+        // Set auth data
         setAccessToken(data.access_token);
         setUser(data.user);
         setStoredRefreshToken(data.refresh_token);
